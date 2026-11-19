@@ -1,13 +1,13 @@
 # Linear Dual Kawase Blur
 
-Dual Filtering (or Dual Kawase) Blur (Marius Bjørge, 2015) is really simple to
+Dual Kawase (or Dual Filtering) Blur (Marius Bjørge, 2015) is really simple to
 implement, runs really fast, is memory bandwidth friendly, and looks really good.
 It fails for gradually blurring, which is a common usecase for any real-time
 applications like games, mobile UI, etc. makes separable gaussian or box blur
 the preferred technique.
 
 My contribution is a set of closed-form equations that map a linear value to the
-inputs of Dual Filtering Blur to achieve a gradual blur. I derived them using a
+inputs of Dual Kawase Blur to achieve a gradual blur. I derived them using a
 PyTorch curve-fitting pipeline that maximizes SSIM against a 3σ Gaussian
 reference (99.7% of the Gaussian shape) on synthetic images across various blur
 radii, then fit the final curves via regression.
