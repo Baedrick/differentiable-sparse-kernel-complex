@@ -1,0 +1,74 @@
+// Copyright (C) 2026 Koh Swee Teck Dedrick.
+// Licensed under the MIT license (https://opensource.org/license/mit/).
+
+#ifndef BASE_ARENA_HPP__
+#define BASE_ARENA_HPP__
+
+namespace dk {
+	u64 constexpr ARENA_HEADER_SIZE = 128;
+
+	using ArenaFlags = u32;
+	enum : u32 {
+		ArenaFlag_None = 0,
+		ArenaFlag_NoChain = 1u << 0
+	};
+
+	struct ArenaParams {
+		u64 reserve_size;
+		u64 commit_size;
+		ArenaFlags flags;
+	};
+
+	struct Arena {
+		Arena *current; ///< Previous arena in chain.
+		Arena *next; ///< Next arena in chain.
+		u64 commit_size;
+		u64 reserve_size;
+		u64 base_pos;
+		u64 pos;
+		u64 committed;
+		u64 reserved;
+		ArenaFlags flags;
+	};
+	static_assert(sizeof(Arena) <= ARENA_HEADER_SIZE);
+
+	struct TempArena {
+		Arena *arena;
+		u64 pos;
+	};
+
+	u64 constexpr ARENA_DEFAULT_RESERVE_SIZE = mega_bytes(64);
+	u64 constexpr ARENA_DEFAULT_COMMIT_SIZE = kilo_bytes(64);
+	ArenaFlags constexpr ARENA_DEFAULT_FLAGS = ArenaFlag_None;
+	ArenaParams constexpr ARENA_DEFAULT_PARAMS = {
+		.reserve_size = ARENA_DEFAULT_RESERVE_SIZE,
+		.commit_size = ARENA_DEFAULT_COMMIT_SIZE,
+		.flags = ARENA_DEFAULT_FLAGS
+	};
+
+	auto arena_alloc(ArenaParams const *params = &ARENA_DEFAULT_PARAMS) noexcept -> Arena *;
+	auto arena_release(Arena *arena) noexcept -> void;
+
+	auto arena_push_bytes(Arena *arena, u64 size, u64 align) noexcept -> void *;
+	auto arena_push_bytes_no_zero(Arena *arena, u64 size, u64 align) noexcept -> void *;
+
+	auto arena_clear(Arena *arena) noexcept -> void;
+	auto arena_pos(Arena *arena) noexcept -> u64;
+	auto arena_pop(Arena *arena, u64 amount) noexcept -> void;
+	auto arena_pop_to(Arena *arena, u64 pos) noexcept -> void;
+
+	auto arena_temp_begin(Arena *arena) noexcept -> TempArena;
+	auto arena_temp_end(TempArena temp) noexcept -> void;
+
+	template <typename T>
+	auto arena_push(Arena *arena) noexcept -> T * {
+		return static_cast<T *>(arena_push_bytes(arena, sizeof(T), max<u64>(8, alignof(T))));
+	}
+
+	template <typename T>
+	auto arena_push_array(Arena *arena, u64 count) noexcept -> T * {
+		return static_cast<T *>(arena_push_bytes(arena, sizeof(T) * count, max<u64>(8, alignof(T))));
+	}
+}
+
+#endif // BASE_ARENA_HPP__
