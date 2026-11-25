@@ -334,95 +334,97 @@ auto dk::pg_blur(Arena *arena, PG_BlurParams const *params) noexcept -> PG_Displ
 
 		ID3D11DeviceContext1 *const d_ctx = d3d11_device_context();
 		switch (params->blur_kind) {
-			case PG_BlurKind_DualFiltering: {
-				ID3D11VertexShader *v_shader_down = pg_context->v_shaders[PG_VShaderKind_DualFilteringDown];
-				ID3D11PixelShader *p_shader_down = pg_context->p_shaders[PG_PShaderKind_DualFilteringDown];
-				ID3D11VertexShader *v_shader_up = pg_context->v_shaders[PG_VShaderKind_DualFilteringUp];
-				ID3D11PixelShader *p_shader_up = pg_context->p_shaders[PG_PShaderKind_DualFilteringUp];
-				ID3D11Buffer *uniform_buffer = pg_context->uniform_buffers[PG_UniformKind_DualFiltering];
+			case PG_BlurKind_DSKC: {
+				ID3D11VertexShader *v_shader = pg_context->v_shaders[PG_VShaderKind_DSKC];
+				ID3D11PixelShader *p_shader = pg_context->p_shaders[PG_PShaderKind_DSKC];
+				ID3D11Buffer *uniform_buffer = pg_context->uniform_buffers[PG_UniformKind_DSKC];
 				uvec2 const src_dim = params->src_dim;
 
-				//~ Dedrick: Count maximum mip down/up.
-				u32 max_pass_count = 0;
-				{
-					uvec2 dim = src_dim;
-					while (dim.x > 1 || dim.y > 1) {
-						dim = max(uvec2{ 1, 1 }, uvec2{ dim.x >> 1, dim.y >> 1 });
-						max_pass_count += 1;
+				//~ Dedrick: Parse DSKC lut.
+				u8 const *lut_base = pg_dskc_lut_file_bytes.data;
+				PG_DSKCLutHeader const *lut_hdr = reinterpret_cast<PG_DSKCLutHeader const *>(lut_base);
+				PG_DSKCLutEntry const *lut_entries = reinterpret_cast<PG_DSKCLutEntry const *>(lut_base + lut_hdr->directory_offset);
+
+				//~ Dedrick: Blur radius changed -> blend the param's neighbors.
+				if (pg_context->dskc_lut_blur_radius != params->blur_radius) {
+					pg_context->dskc_lut_blur_radius = params->blur_radius;
+
+					//~ Dedrick: Find base member.
+					f32 const param = clamp(static_cast<f32>(params->blur_radius), lut_hdr->param_min, lut_hdr->param_max);
+					u32 member = 0;
+					while (member + 2 < lut_hdr->directory_count && lut_entries[member + 1].param <= param) {
+						member += 1;
 					}
+
+					//~ Dedrick: Blend base and next member.
+					f32 const blend_t = inverse_mix(lut_entries[member].param, lut_entries[member + 1].param, param);
+					PG_DSKCLutEntry const *base_entry = lut_entries + member;
+					PG_DSKCLutEntry const *next_entry = base_entry + 1;
+					PG_DSKCLutTap const *base_taps = reinterpret_cast<PG_DSKCLutTap const *>(lut_base + base_entry->tap_offset);
+					PG_DSKCLutTap const *next_taps = reinterpret_cast<PG_DSKCLutTap const *>(lut_base + next_entry->tap_offset);
+					PG_DSKCLutTap *const taps = arena_push_array<PG_DSKCLutTap>(scratch.arena, base_entry->tap_count);
+					for (u32 idx = 0; idx < base_entry->tap_count; ++idx) {
+						PG_DSKCLutTap *tap = &taps[idx];
+						tap->offset_x = mix(base_taps[idx].offset_x, next_taps[idx].offset_x, blend_t);
+						tap->offset_y = mix(base_taps[idx].offset_y, next_taps[idx].offset_y, blend_t);
+						tap->weight = mix(base_taps[idx].weight, next_taps[idx].weight, blend_t);
+					}
+
+					D3D11_MAPPED_SUBRESOURCE mapped = {};
+					d_ctx->Map(pg_context->dskc_lut_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+					memory_copy(mapped.pData, taps, base_entry->tap_count * sizeof(PG_DSKCLutTap));
+					d_ctx->Unmap(pg_context->dskc_lut_buffer, 0);
 				}
 
-				//~ Dedrick: @dual_filtering
-				f32 const radius = static_cast<f32>(params->blur_radius);
-				u32 const pass_count = min(max_pass_count, max<u32>(1, static_cast<u32>(round(0.6214f * log_e(radius) + 0.2908f))));
-				f32 const distance = 0.5287f * radius / sqrt(static_cast<f32>((1u << (2 * pass_count)) - 1u));
-
-				//~ Dedrick: Build blur mip chain & set up uniforms.
-				PG_BlurTexture **mips = arena_push_array<PG_BlurTexture *>(scratch.arena, pass_count + 1);
+				//~ Dedrick: Set up uniforms.
 				{
-					PG_Uniform_DualFiltering uniforms = {};
-
-					//~ Dedrick: Fill uniforms for blur mip chain.
-					uvec2 dim = src_dim;
-					mips[0] = pg_blur_texture_cache_get_or_create(dim, DXGI_FORMAT_R11G11B10_FLOAT);
-					uniforms.passes[0].uv_step = { distance / dim.x, distance / dim.y };
-					for (u32 pass = 1; pass <= pass_count; ++pass) {
-						dim = max(uvec2{ 1, 1 }, uvec2{ dim.x >> 1, dim.y >> 1 });
-						mips[pass] = pg_blur_texture_cache_get_or_create(dim, DXGI_FORMAT_R11G11B10_FLOAT);
-						uniforms.passes[pass].uv_step = { distance / dim.x, distance / dim.y };
+					PG_Uniform_DSKC uniforms = {};
+					f32 const inv_w = 1.0f / static_cast<f32>(src_dim.x);
+					f32 const inv_h = 1.0f / static_cast<f32>(src_dim.y);
+					for (u32 pass = 0; pass < lut_hdr->layer_count; ++pass) {
+						uniforms.passes[pass].uv_step = { inv_w, inv_h };
+						uniforms.passes[pass].layer = static_cast<s32>(pass);
+						uniforms.passes[pass].sample_count = static_cast<s32>(lut_hdr->sample_count);
 					}
-
 					D3D11_MAPPED_SUBRESOURCE mapped_cbuffer = {};
 					d_ctx->Map(uniform_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_cbuffer);
 					memory_copy_struct(mapped_cbuffer.pData, &uniforms);
 					d_ctx->Unmap(uniform_buffer, 0);
 				}
 
-				u32 const uniform_stride = static_cast<u32>(sizeof(PG_Uniform_DualFilteringPass) / 16);
+				//~ Dedrick: Set rasterizer.
+				D3D11_VIEWPORT const viewport = { 0.0f, 0.0f, static_cast<f32>(src_dim.x), static_cast<f32>(src_dim.y), 0.0f, 1.0f };
+				d_ctx->RSSetViewports(1, &viewport);
 
 				//~ Dedrick: Set input assembly.
 				d_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 				d_ctx->IASetInputLayout(nullptr);
 
+				//~ Dedrick: Set shaders.
+				d_ctx->VSSetShader(v_shader, nullptr, 0);
+				d_ctx->PSSetShader(p_shader, nullptr, 0);
+				d_ctx->PSSetShaderResources(1, 1, &pg_context->dskc_lut_buffer_srv);
+
 				// NOTE(Dedrick): For unbinding rtv.
 				ID3D11RenderTargetView *rtv = nullptr;
 
-				//~ Dedrick: Downsample passes.
-				{
-					d_ctx->VSSetShader(v_shader_down, nullptr, 0);
-					d_ctx->PSSetShader(p_shader_down, nullptr, 0);
-					ID3D11ShaderResourceView *srv = params->src_srv;
-					for (u32 pass = 1; pass <= pass_count; ++pass) {
-						PG_BlurTexture *const blur_texture = mips[pass];
-						D3D11_VIEWPORT const viewport = { 0.0f, 0.0f, static_cast<f32>(blur_texture->dim.x), static_cast<f32>(blur_texture->dim.y), 0.0f, 1.0f };
-						d_ctx->RSSetViewports(1, &viewport);
-						d_ctx->OMSetRenderTargets(1, &blur_texture->rtv, nullptr);
-						u32 const uniform_offset = uniform_stride * pass;
-						d_ctx->PSSetConstantBuffers1(0, 1, &uniform_buffer, &uniform_offset, &uniform_stride);
-						d_ctx->PSSetShaderResources(0, 1, &srv);
-						d_ctx->Draw(3, 0);
-						d_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-						pg_display_entry_list_push(arena, &display_entries, str8f(arena, "Down %d", pass), blur_texture->dim, blur_texture->srv);
-						srv = blur_texture->srv;
-					}
-				}
-
-				//~ Dedrick: Upsample passes.
-				{
-					d_ctx->VSSetShader(v_shader_up, nullptr, 0);
-					d_ctx->PSSetShader(p_shader_up, nullptr, 0);
-					for (u32 pass = pass_count; pass --> 0; ) {
-						PG_BlurTexture *const blur_texture = mips[pass];
-						D3D11_VIEWPORT const viewport = { 0.0f, 0.0f, static_cast<f32>(blur_texture->dim.x), static_cast<f32>(blur_texture->dim.y), 0.0f, 1.0f };
-						d_ctx->RSSetViewports(1, &viewport);
-						d_ctx->OMSetRenderTargets(1, &blur_texture->rtv, nullptr);
-						u32 const uniform_offset = uniform_stride * pass;
-						d_ctx->PSSetConstantBuffers1(0, 1, &uniform_buffer, &uniform_offset, &uniform_stride);
-						d_ctx->PSSetShaderResources(0, 1, &mips[pass + 1]->srv);
-						d_ctx->Draw(3, 0);
-						d_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-						pg_display_entry_list_push(arena, &display_entries, str8f(arena, "Up %d", pass_count - pass), blur_texture->dim, blur_texture->srv);
-					}
+				//~ Dedrick: Cascade passes, layer 1..L in order (ping-pong targets).
+				PG_BlurTexture *blur_textures[2] = {
+					pg_blur_texture_cache_get_or_create(src_dim, DXGI_FORMAT_R16G16B16A16_FLOAT),
+					pg_blur_texture_cache_get_or_create(src_dim, DXGI_FORMAT_R16G16B16A16_FLOAT)
+				};
+				ID3D11ShaderResourceView *input_srv = params->src_srv;
+				for (u32 pass = 0; pass < lut_hdr->layer_count; ++pass) {
+					PG_BlurTexture *const out_texture = blur_textures[pass % 2];
+					d_ctx->OMSetRenderTargets(1, &out_texture->rtv, nullptr);
+					u32 const uniform_count = static_cast<u32>(sizeof(PG_Uniform_DSKCPass) / 16);
+					u32 const uniform_offset = pass * uniform_count;
+					d_ctx->PSSetConstantBuffers1(0, 1, &uniform_buffer, &uniform_offset, &uniform_count);
+					d_ctx->PSSetShaderResources(0, 1, &input_srv);
+					d_ctx->Draw(3, 0);
+					d_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+					pg_display_entry_list_push(arena, &display_entries, str8f(arena, "DSKC %d", pass + 1), out_texture->dim, out_texture->srv);
+					input_srv = out_texture->srv;
 				}
 				break;
 			}
@@ -661,6 +663,54 @@ auto dk::pg_init(CmdLine *cmd_line) noexcept -> void {
 		}
 		d3d11_device()->CreateBuffer(&desc, nullptr, &pg_context->gaussian_kernel_buffer);
 		d3d11_device()->CreateShaderResourceView(pg_context->gaussian_kernel_buffer, &srv_desc, &pg_context->gaussian_kernel_buffer_srv);
+	}
+
+	//~ Dedrick: Set up DSKC state.
+	{
+		TempArena const scratch = scratch_begin(nullptr, 0);
+		dk_defer(scratch_end(scratch));
+
+		//~ Dedrick: Validate & parse lut.
+		u8 const *base = pg_dskc_lut_file_bytes.data;
+		u8 const *opl = pg_dskc_lut_file_bytes.data + pg_dskc_lut_file_bytes.size;
+		if (base + sizeof(PG_DSKCLutHeader) > opl) {
+			dt_show_dialog(nullptr, "Fatal Error"_str8, "DSKC lut is missing its header"_str8, true);
+			abort_self(0);
+		}
+		PG_DSKCLutHeader const *header = reinterpret_cast<PG_DSKCLutHeader const *>(base);
+		if (base + header->directory_offset + header->directory_count * sizeof(PG_DSKCLutEntry) > opl) {
+			dt_show_dialog(nullptr, "Fatal Error"_str8, "DSKC lut invalid directory layout"_str8, true);
+			abort_self(0);
+		}
+		if (header->layer_count > array_count(PG_Uniform_DSKC{}.passes)) {
+			String8 const msg = str8f(scratch.arena, "DSKC lut layer count exceeds supported amount (%llu)", array_count(PG_Uniform_DSKC{}.passes));
+			dt_show_dialog(nullptr, "Fatal Error"_str8, msg, true);
+			abort_self(0);
+		}
+		if (header->param_min >= header->param_max) {
+			String8 const msg = str8f(scratch.arena, "DSKC lut invalid param (min: %.03f, max: %.03f) range", header->param_min, header->param_max);
+			dt_show_dialog(nullptr, "Fatal Error"_str8, msg, true);
+			abort_self(0);
+		}
+
+		//~ Dedrick: Create lut buffer.
+		u32 const tap_float_count = header->layer_count * header->sample_count * 3;
+		D3D11_BUFFER_DESC desc = {};
+		{
+			desc.ByteWidth = static_cast<UINT>(tap_float_count * sizeof(f32));
+			desc.Usage = D3D11_USAGE_DYNAMIC;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		{
+			srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+			srv_desc.Buffer.FirstElement = 0;
+			srv_desc.Buffer.NumElements = tap_float_count;
+		}
+		d3d11_device()->CreateBuffer(&desc, nullptr, &pg_context->dskc_lut_buffer);
+		d3d11_device()->CreateShaderResourceView(pg_context->dskc_lut_buffer, &srv_desc, &pg_context->dskc_lut_buffer_srv);
 	}
 
 	//~ Dedrick: Set up benchmark.

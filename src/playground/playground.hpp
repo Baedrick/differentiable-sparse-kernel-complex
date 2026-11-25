@@ -30,48 +30,72 @@ namespace dk {
 		Semaphore load_completion_semaphore;
 	};
 
-	constexpr s32 PG_BlurRadiusMax = 500;
+	constexpr s32 PG_BlurRadiusMax = 250;
 	constexpr f32 PG_ViewportZoomMin = 1.0f / 256.0f;
 	constexpr f32 PG_ViewportZoomMax = 256.0f;
 
 	enum PG_VShaderKind {
-		PG_VShaderKind_DualFilteringDown,
-		PG_VShaderKind_DualFilteringUp,
+		PG_VShaderKind_DSKC,
 		PG_VShaderKind_SeparableGaussian,
 		PG_VShaderKind_Finalize,
 		PG_VShaderKind_COUNT
 	};
 	inline String8 const pg_v_shader_kind_src_table[] = {
-		pg_dual_filtering_down_vs_bytes,
-		pg_dual_filtering_up_vs_bytes,
+		pg_dskc_vs_bytes,
 		pg_separable_gaussian_vs_bytes,
 		pg_finalize_vs_bytes,
 	};
 	static_assert(array_count(pg_v_shader_kind_src_table) == PG_VShaderKind_COUNT);
 
 	enum PG_PShaderKind {
-		PG_PShaderKind_DualFilteringDown,
-		PG_PShaderKind_DualFilteringUp,
+		PG_PShaderKind_DSKC,
 		PG_PShaderKind_SeparableGaussian,
 		PG_PShaderKind_Finalize,
 		PG_PShaderKind_COUNT
 	};
 	inline String8 const pg_p_shader_kind_src_table[] = {
-		pg_dual_filtering_down_ps_bytes,
-		pg_dual_filtering_up_ps_bytes,
+		pg_dskc_ps_bytes,
 		pg_separable_gaussian_ps_bytes,
 		pg_finalize_ps_bytes,
 	};
 	static_assert(array_count(pg_p_shader_kind_src_table) == PG_PShaderKind_COUNT);
 
-	struct PG_Uniform_DualFilteringPass {
-		vec2 uv_step;
-		u8 _pad0[248];
-	};
-	static_assert(sizeof(PG_Uniform_DualFilteringPass) % 256 == 0);
+	constexpr u32 PG_DSKCLutMaxLayers = 48;
 
-	struct PG_Uniform_DualFiltering {
-		PG_Uniform_DualFilteringPass passes[15]; // NOTE(Dedrick): Max mips: 1 + log2(16384).
+	struct PG_DSKCLutHeader {
+		f32 param_min;
+		f32 param_max;
+		u32 layer_count;
+		u32 sample_count;
+		u32 directory_offset;
+		u32 directory_count;
+	};
+	static_assert(sizeof(PG_DSKCLutHeader) == 24);
+
+	struct PG_DSKCLutEntry {
+		f32 param;
+		u32 tap_offset;
+		u32 tap_count;
+	};
+	static_assert(sizeof(PG_DSKCLutEntry) == 12);
+
+	struct PG_DSKCLutTap {
+		f32 offset_x;
+		f32 offset_y;
+		f32 weight;
+	};
+	static_assert(sizeof(PG_DSKCLutTap) == 12);
+
+	struct PG_Uniform_DSKCPass {
+		vec2 uv_step;
+		s32 layer;
+		s32 sample_count;
+		u8 _pad0[240];
+	};
+	static_assert(sizeof(PG_Uniform_DSKCPass) % 256 == 0);
+
+	struct PG_Uniform_DSKC {
+		PG_Uniform_DSKCPass passes[PG_DSKCLutMaxLayers];
 	};
 
 	struct PG_Uniform_GaussianPass {
@@ -86,23 +110,23 @@ namespace dk {
 	};
 
 	enum PG_UniformKind {
-		PG_UniformKind_DualFiltering,
+		PG_UniformKind_DSKC,
 		PG_UniformKind_SeparableGaussian,
 		PG_UniformKind_COUNT
 	};
 	inline u64 const pg_uniform_type_kind_size_table[] = {
-		sizeof(PG_Uniform_DualFiltering),
+		sizeof(PG_Uniform_DSKC),
 		sizeof(PG_Uniform_Gaussian),
 	};
 	static_assert(array_count(pg_uniform_type_kind_size_table) == PG_UniformKind_COUNT);
 
 	enum PG_BlurKind {
-		PG_BlurKind_DualFiltering,
+		PG_BlurKind_DSKC,
 		PG_BlurKind_SeparableGaussian,
 		PG_BlurKind_COUNT
 	};
 	inline String8 const pg_blur_kind_name_table[] = {
-		"Dual Filtering (Dual Kawase)"_str8,
+		"Differentiable Sparse Kernel Complex"_str8,
 		"Separable Gaussian"_str8,
 	};
 	static_assert(array_count(pg_blur_kind_name_table) == PG_BlurKind_COUNT);
@@ -246,6 +270,11 @@ namespace dk {
 		ID3D11Buffer *gaussian_kernel_buffer;
 		ID3D11ShaderResourceView *gaussian_kernel_buffer_srv;
 		s32 gaussian_kernel_radius;
+
+		//~ Dedrick: DSKC state.
+		ID3D11Buffer *dskc_lut_buffer;
+		ID3D11ShaderResourceView *dskc_lut_buffer_srv;
+		s32 dskc_lut_blur_radius;
 
 		//~ Dedrick: Benchmark options.
 		u32 benchmark_blur_kind_flags;
