@@ -146,7 +146,7 @@ def main():
 			kernels.append((member_param, kernel / float(kernel.sum())))
 
 	#~ Dedrick: Set up taps.
-	previous_taps = np.empty((arguments.layers, arguments.samples, 3), dtype=np.float32)
+	previous_parameters = np.empty((arguments.layers, arguments.samples, 3), dtype=np.float32)
 	first_kernel = kernels[0][1]
 	first_kernel_rows, first_kernel_cols = first_kernel.shape
 	first_center_row, first_center_col = first_kernel_rows // 2, first_kernel_cols // 2
@@ -170,18 +170,18 @@ def main():
 		chosen_indices.append(fill_slot % support_count)
 	chosen_indices = np.asarray(chosen_indices)
 	slot_order = np.lexsort((first_support_cols[chosen_indices], first_support_rows[chosen_indices]))
-	previous_taps[0, :, 0] = first_center_col - first_support_cols[chosen_indices[slot_order]]
-	previous_taps[0, :, 1] = first_center_row - first_support_rows[chosen_indices[slot_order]]
-	previous_taps[0, :, 2] = 1.0 / arguments.samples
+	previous_parameters[0, :, 0] = first_center_col - first_support_cols[chosen_indices[slot_order]]
+	previous_parameters[0, :, 1] = first_center_row - first_support_rows[chosen_indices[slot_order]]
+	previous_parameters[0, :, 2] = 1.0 / arguments.samples
 
 	#~ Dedrick: Pass 2..L ring sampling.
 	ring_angles = np.arange(arguments.samples, dtype=np.float32) * (2.0 * math.pi / arguments.samples)
 	ring_cos, ring_sin = np.cos(ring_angles), np.sin(ring_angles)
 	for layer_index in range(1, arguments.layers):
 		ring_radius = (layer_index + 1) * first_ring_step
-		previous_taps[layer_index, :, 0] = ring_radius * ring_cos
-		previous_taps[layer_index, :, 1] = ring_radius * ring_sin
-		previous_taps[layer_index, :, 2] = 1.0 / arguments.samples
+		previous_parameters[layer_index, :, 0] = ring_radius * ring_cos
+		previous_parameters[layer_index, :, 1] = ring_radius * ring_sin
+		previous_parameters[layer_index, :, 2] = 1.0 / arguments.samples
 
 	#~ Dedrick: Train LUT.
 	charbonnier_epsilon = 1e-4
@@ -211,8 +211,8 @@ def main():
 		#~ Dedrick: Trainable layer parameters.
 		layer_params = []
 		for layer_index in range(arguments.layers):
-			offsets = (torch.tensor(previous_taps[layer_index, :, :2], device=device) * warm_start_scale).requires_grad_(True)
-			weights = torch.tensor(previous_taps[layer_index, :, 2], device=device, requires_grad=True)
+			offsets = (torch.tensor(previous_parameters[layer_index, :, :2], device=device) * warm_start_scale).requires_grad_(True)
+			weights = torch.tensor(previous_parameters[layer_index, :, 2], device=device, requires_grad=True)
 			layer_params.append((offsets, weights))
 		optimizer = torch.optim.Adam([parameter for offsets, weights in layer_params for parameter in (offsets, weights)], lr=arguments.lr)
 
@@ -242,12 +242,17 @@ def main():
 				print(f"  member {member_index + 1}/{len(kernels)} param {member_param:.2f} step {step + 1}/{arguments.steps} loss {loss.item():.3e}", flush=True)
 
 		#~ Dedrick: Extract trained member taps.
+		# NOTE(Dedrick): Warm start stays in parameter space. The LUT stores the
+		# gated weights.
 		member_taps = np.empty((arguments.layers, arguments.samples, 3), dtype=np.float32)
 		for layer_index, (offsets, weights) in enumerate(layer_params):
-			member_taps[layer_index, :, :2] = offsets.detach().cpu().numpy()
+			raw_offsets = offsets.detach().cpu().numpy()
+			raw_weights = weights.detach().cpu().numpy()
+			previous_parameters[layer_index, :, :2] = raw_offsets
+			previous_parameters[layer_index, :, 2] = raw_weights
+			member_taps[layer_index, :, :2] = raw_offsets
 			member_taps[layer_index, :, 2] = dk_gated_weights(weights.detach()).cpu().numpy()
 		members.append((member_param, member_taps))
-		previous_taps = member_taps
 		print(f"trained member {member_index + 1}/{len(kernels)} param {member_param:.4f} loss {loss.item():.3e}")
 
 	#~ Dedrick: Export LUT.
