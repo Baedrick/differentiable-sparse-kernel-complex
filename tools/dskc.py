@@ -30,8 +30,8 @@
 #  }
 #
 # IMPLEMENTATION DETAILS
-# 1. The ring step is dr = 2 * extent / (L * (L + 1)) so the cumulative ring
-#     walk covers the full target extent.
+# 1. The ring step is dr = extent / (L * (L + 1)). The tighter step keeps the
+#     later layers close to the first-layer shape instead of blurring it.
 # 2. The training canvas starts at 49 pixels. It grows when the kernel extent
 #     plus the cumulative ring walk no longer fits. Border padding clamps
 #     samples that land past the edge and zeroes the gradients of taps that
@@ -42,7 +42,7 @@
 #     center minus position to compute convolution.
 # 4. Accepted coordinates are an unordered set. A raster prefix scan would
 #     strand early taps in the top band of ink because greedy acceptance
-#     exhausts after about (pi / 2) * S pixels. Candidates come from a random
+#     exhausts after about (pi / 2) * S pixels. Small members use a seeded
 #     permutation of the support instead. Accepted coordinates sort
 #     lexicographically so slot positions line up across basis members.
 # 5. Weights use sum-to-one normalization. Unconstrained signed weights produce
@@ -50,16 +50,17 @@
 #     bright features after tonemapping. A softplus gate keeps weights positive
 #     before normalization. A gate scale of 8 keeps weight gradients on par
 #     with coordinate offset updates at the default learning rate.
-# 6. Each basis member trains on its own. Adjacent members share aligned tap
-#     slots by initializing member k from scaled parameters of member k - 1.
-#     Independent training produces inconsistent slot permutations that cause
-#     visual splitting during runtime linear interpolation.
+# 6. Small members initialize independently. Layer 1 uses sparse sampling from
+#     the member support and layers 2..L use increasing radial rings. Members
+#     with enough support initialize from the previous member's scaled raw
+#     parameters and train against a lerped target so their factorizations stay
+#     close enough for runtime interpolation.
 # 7. The member count follows the scale ratio gap as
 #     ceil(log(param_max / param_min) / log(gap)). The count clamps to two so
 #     runtime interpolation always has a bracket. A gap of 1.25 preserves
 #     reconstruction accuracy across adjacent tap blends.
-# 8. The default schedule runs 3000 steps and decays the learning rate from
-#     1e-2 to 1e-3, which converges across the tested range.
+# 8. The default schedule runs 1000 steps and decays the learning rate from
+#     1e-3 to 1e-4.
 
 import argparse
 import math
@@ -76,6 +77,8 @@ from PIL import Image
 # kernel mass.
 DSKC_CanvasDimMin = 49
 DSKC_SupportFloor = 0.01
+DSKC_MidpointSupportMin = 8.0
+DSKC_MidpointLossWeight = 2.0
 
 
 def dk_gated_weights(weights):
@@ -94,8 +97,8 @@ def main():
 	parser.add_argument("--gap", type=float, default=1.25, help="Scale ratio between adjacent members (default 1.25)")
 	parser.add_argument("--layers", type=int, default=4, help="Cascade passes L (default 4)")
 	parser.add_argument("--samples", type=int, default=32, help="Samples per pass N (default 32)")
-	parser.add_argument("--steps", type=int, default=3000, help="Optimization steps per member (default 3000)")
-	parser.add_argument("--lr", type=float, default=1e-2, help="Initial Adam rate (default 1e-2)")
+	parser.add_argument("--steps", type=int, default=1000, help="Optimization steps per member (default 1000)")
+	parser.add_argument("--lr", type=float, default=1e-3, help="Initial Adam rate (default 1e-3)")
 	parser.add_argument("--backend", choices=("auto", "cpu", "cuda"), default="auto", help="Torch device for training (default auto)")
 
 	#~ Dedrick: Parse arguments.
@@ -112,9 +115,11 @@ def main():
 		param_min = float(arguments.custom[1])
 		param_max = float(arguments.custom[2])
 
+	#~ Dedrick: Generate member parameters (Eq. 8).
 	member_count = max(2, math.ceil(math.log(param_max / param_min) / math.log(arguments.gap)))
 	member_params = [param_min * (param_max / param_min) ** (member_index / (member_count - 1)) for member_index in range(member_count)]
 
+	#~ Dedrick: Build target kernels.
 	kernels = []
 	if arguments.gaussian:
 		for member_param in member_params:
@@ -123,7 +128,8 @@ def main():
 			mesh_col, mesh_row = np.meshgrid(axis, axis)
 			radius_squared = mesh_col * mesh_col + mesh_row * mesh_row
 			kernel = np.exp(-radius_squared / (2.0 * member_param * member_param))
-			kernel[kernel < DSKC_SupportFloor * kernel.max()] = 0.0
+			kernel_peak = kernel.max()
+			kernel[kernel < DSKC_SupportFloor * kernel_peak] = 0.0
 			kernels.append((member_param, kernel / float(kernel.sum())))
 	else:
 		stamp = Image.open(stamp_path).convert("L")
@@ -142,88 +148,97 @@ def main():
 			canvas = Image.new("L", (canvas_size, canvas_size), 0)
 			canvas.paste(stamp_resized, ((canvas_size - member_width) // 2, (canvas_size - member_height) // 2))
 			kernel = np.asarray(canvas, dtype=np.float32) / 255.0
-			kernel[kernel < DSKC_SupportFloor * kernel.max()] = 0.0
+			kernel_peak = kernel.max()
+			kernel[kernel < DSKC_SupportFloor * kernel_peak] = 0.0
 			kernels.append((member_param, kernel / float(kernel.sum())))
 
-	#~ Dedrick: Set up taps.
-	previous_parameters = np.empty((arguments.layers, arguments.samples, 3), dtype=np.float32)
-	first_kernel = kernels[0][1]
-	first_kernel_rows, first_kernel_cols = first_kernel.shape
-	first_center_row, first_center_col = first_kernel_rows // 2, first_kernel_cols // 2
-	first_support_rows, first_support_cols = np.nonzero(first_kernel)
-	first_support_extent = max(first_support_rows.max() - first_support_rows.min() + 1, first_support_cols.max() - first_support_cols.min() + 1) * 0.5
-	first_ring_step = 2.0 * first_support_extent / (arguments.layers * (arguments.layers + 1))
-
-	#~ Dedrick: Pass 1 greedy rejection sampling.
-	support_count = first_support_rows.size
-	rejection_radius_squared = support_count / (arguments.samples * math.pi)
-	scan_order = np.random.default_rng(0).permutation(support_count)
-	chosen_indices = []
-	squared_distance_min = np.full(support_count, np.inf)
-	for scan_index in scan_order:
-		if len(chosen_indices) >= arguments.samples:
-			break
-		if squared_distance_min[scan_index] >= rejection_radius_squared:
-			chosen_indices.append(scan_index)
-			np.minimum(squared_distance_min, (first_support_rows - first_support_rows[scan_index]) ** 2 + (first_support_cols - first_support_cols[scan_index]) ** 2, out=squared_distance_min)
-	for fill_slot in range(arguments.samples - len(chosen_indices)):
-		chosen_indices.append(fill_slot % support_count)
-	chosen_indices = np.asarray(chosen_indices)
-	slot_order = np.lexsort((first_support_cols[chosen_indices], first_support_rows[chosen_indices]))
-	previous_parameters[0, :, 0] = first_center_col - first_support_cols[chosen_indices[slot_order]]
-	previous_parameters[0, :, 1] = first_center_row - first_support_rows[chosen_indices[slot_order]]
-	previous_parameters[0, :, 2] = 1.0 / arguments.samples
-
-	#~ Dedrick: Pass 2..L ring sampling.
-	ring_angles = np.arange(arguments.samples, dtype=np.float32) * (2.0 * math.pi / arguments.samples)
-	ring_cos, ring_sin = np.cos(ring_angles), np.sin(ring_angles)
-	for layer_index in range(1, arguments.layers):
-		ring_radius = (layer_index + 1) * first_ring_step
-		previous_parameters[layer_index, :, 0] = ring_radius * ring_cos
-		previous_parameters[layer_index, :, 1] = ring_radius * ring_sin
-		previous_parameters[layer_index, :, 2] = 1.0 / arguments.samples
-
-	#~ Dedrick: Train LUT.
+	#~ Dedrick: Train members.
 	charbonnier_epsilon = 1e-4
 	members = []
+	previous_raw_parameters = None
+	previous_raw_param = 0.0
 	learning_rate_delta = (arguments.lr * 0.1 - arguments.lr) / max(1, arguments.steps - 1)
+	ring_angles = np.arange(arguments.samples, dtype=np.float32) * (2.0 * math.pi / arguments.samples)
+	ring_cos, ring_sin = np.cos(ring_angles), np.sin(ring_angles)
+	layer_walk_count = arguments.layers * (arguments.layers + 1)
 	for member_index, (member_param, member_kernel) in enumerate(kernels):
-		warm_start_scale = 1.0 if member_index == 0 else member_param / kernels[member_index - 1][0]
 		kernel_rows, kernel_cols = member_kernel.shape
 		support_rows, support_cols = np.nonzero(member_kernel)
 		member_support_extent = max(support_rows.max() - support_rows.min() + 1, support_cols.max() - support_cols.min() + 1) * 0.5
-		member_ring_step = 2.0 * member_support_extent / (arguments.layers * (arguments.layers + 1))
-		reach = member_support_extent + member_ring_step * (arguments.layers * (arguments.layers + 1) // 2 - 1)
+		member_ring_step = member_support_extent / layer_walk_count
+		reach = member_support_extent + member_ring_step * (layer_walk_count // 2 - 1)
 		canvas_size = max(DSKC_CanvasDimMin, 2 * math.ceil(reach) + 1)
+		normalized_scale = 2.0 / (canvas_size - 1.0)
+		normalized_support_extent = member_support_extent * normalized_scale
+		use_midpoint = member_index > 0 and member_support_extent >= DSKC_MidpointSupportMin
+
+		#~ Dedrick: Canvas and target (Eq. 10).
 		center = canvas_size // 2
 		impulse = torch.zeros((canvas_size, canvas_size), device=device)
 		impulse[center, center] = 1.0
 		target = torch.zeros((canvas_size, canvas_size), device=device)
+		# Eq. 4, target kernel.
 		paste_row, paste_col = center - kernel_rows // 2, center - kernel_cols // 2
 		target[paste_row:paste_row + kernel_rows, paste_col:paste_col + kernel_cols] = torch.from_numpy(member_kernel).to(device)
 
-		#~ Dedrick: Base grid and coordinate scale.
+		#~ Dedrick: Initialize taps (Eq. 6 and Eq. 7).
+		initial_parameters = np.empty((arguments.layers, arguments.samples, 3), dtype=np.float32)
+		if use_midpoint:
+			initial_parameters[:, :, :2] = previous_raw_parameters[:, :, :2] * (member_param / previous_raw_param) * normalized_scale
+			initial_parameters[:, :, 2] = previous_raw_parameters[:, :, 2]
+		else:
+			member_center_row, member_center_col = kernel_rows // 2, kernel_cols // 2
+			support_count = support_rows.size
+			rejection_radius_squared = support_count / (arguments.samples * math.pi)
+			scan_order = np.random.default_rng(member_index).permutation(support_count)
+			chosen_indices = []
+			squared_distance_min = np.full(support_count, np.inf)
+			for scan_index in scan_order:
+				if len(chosen_indices) >= arguments.samples:
+					break
+				if squared_distance_min[scan_index] >= rejection_radius_squared:
+					chosen_indices.append(scan_index)
+					np.minimum(squared_distance_min, (support_rows - support_rows[scan_index]) ** 2 + (support_cols - support_cols[scan_index]) ** 2, out=squared_distance_min)
+			for fill_slot in range(arguments.samples - len(chosen_indices)):
+				chosen_indices.append(fill_slot % support_count)
+			chosen_indices = np.asarray(chosen_indices)
+			slot_order = np.lexsort((support_cols[chosen_indices], support_rows[chosen_indices]))
+			initial_parameters[0, :, 0] = (member_center_col - support_cols[chosen_indices[slot_order]]) * normalized_scale
+			initial_parameters[0, :, 1] = (member_center_row - support_rows[chosen_indices[slot_order]]) * normalized_scale
+			initial_parameters[0, :, 2] = 1.0 / arguments.samples
+			# Eq. 6, radial rings.
+			for layer_index in range(1, arguments.layers):
+				ring_radius = (layer_index + 1) * member_ring_step
+				initial_parameters[layer_index, :, 0] = ring_radius * ring_cos * normalized_scale
+				initial_parameters[layer_index, :, 1] = ring_radius * ring_sin * normalized_scale
+				initial_parameters[layer_index, :, 2] = 1.0 / arguments.samples
+
+		#~ Dedrick: Base grid.
 		axis = torch.linspace(-1.0, 1.0, canvas_size, device=device)
 		mesh_row, mesh_col = torch.meshgrid(axis, axis, indexing="ij")
 		base_grid = torch.stack((mesh_col, mesh_row), dim=-1)
-		coordinate_scale = torch.tensor([2.0 / (canvas_size - 1.0), 2.0 / (canvas_size - 1.0)], device=device)
 
-		#~ Dedrick: Trainable layer parameters.
+		#~ Dedrick: Trainable layer parameters (Eq. 5).
 		layer_params = []
 		for layer_index in range(arguments.layers):
-			offsets = (torch.tensor(previous_parameters[layer_index, :, :2], device=device) * warm_start_scale).requires_grad_(True)
-			weights = torch.tensor(previous_parameters[layer_index, :, 2], device=device, requires_grad=True)
+			offsets = torch.tensor(initial_parameters[layer_index, :, :2], device=device, requires_grad=True)
+			weights = torch.tensor(initial_parameters[layer_index, :, 2], device=device, requires_grad=True)
 			layer_params.append((offsets, weights))
 		optimizer = torch.optim.Adam([parameter for offsets, weights in layer_params for parameter in (offsets, weights)], lr=arguments.lr)
+		if use_midpoint:
+			previous_param, previous_taps = members[-1]
+			previous_offsets = torch.from_numpy(previous_taps[:, :, :2]).to(device)
+			previous_weights = torch.from_numpy(previous_taps[:, :, 2]).to(device)
+			interpolation_rng = np.random.default_rng(member_index)
 
-		#~ Dedrick: Optimization steps.
+		#~ Dedrick: Optimization steps (Eq. 3 and Eq. 11).
 		for step in range(arguments.steps):
 			optimizer.param_groups[0]["lr"] = arguments.lr + step * learning_rate_delta
 			optimizer.zero_grad(set_to_none=True)
 			synthesized = impulse
 			for offsets, weights in layer_params:
 				gated_weights = dk_gated_weights(weights)
-				sample_grid = base_grid + (offsets * coordinate_scale).view(arguments.samples, 1, 1, 2)
+				sample_grid = base_grid + offsets.view(arguments.samples, 1, 1, 2)
 				sampled = F.grid_sample(
 					synthesized[None].expand(arguments.samples, 1, canvas_size, canvas_size),
 					sample_grid,
@@ -232,41 +247,70 @@ def main():
 					align_corners=True
 				)
 				synthesized = (sampled.view(arguments.samples, canvas_size, canvas_size) * gated_weights.view(-1, 1, 1)).sum(dim=0)
+			# Eq. 11, Charbonnier L1.
 			kernel_error = synthesized - target
 			loss = ((kernel_error * kernel_error + charbonnier_epsilon * charbonnier_epsilon).sqrt() - charbonnier_epsilon).mean()
+			if use_midpoint:
+				#~ Dedrick: Midpoint loss for runtime interpolation.
+				t = interpolation_rng.random()
+				interpolated_param = previous_param + t * (member_param - previous_param)
+				target_scale = interpolated_param / member_param
+				midpoint_target = F.grid_sample(
+					target[None, None],
+					(base_grid / target_scale)[None],
+					mode="bilinear",
+					padding_mode="zeros",
+					align_corners=True
+				)[0, 0]
+				midpoint_target = midpoint_target / midpoint_target.sum()
+				midpoint = impulse
+				for layer_index, (offsets, weights) in enumerate(layer_params):
+					current_offsets = offsets / normalized_scale
+					current_weights = dk_gated_weights(weights)
+					midpoint_offsets = ((1.0 - t) * previous_offsets[layer_index] + t * current_offsets) * normalized_scale
+					midpoint_weights = (1.0 - t) * previous_weights[layer_index] + t * current_weights
+					sample_grid = base_grid + midpoint_offsets.view(arguments.samples, 1, 1, 2)
+					sampled = F.grid_sample(
+						midpoint[None].expand(arguments.samples, 1, canvas_size, canvas_size),
+						sample_grid,
+						mode="bilinear",
+						padding_mode="border",
+						align_corners=True
+					)
+					midpoint = (sampled.view(arguments.samples, canvas_size, canvas_size) * midpoint_weights.view(-1, 1, 1)).sum(dim=0)
+				midpoint_error = midpoint - midpoint_target
+				loss = loss + DSKC_MidpointLossWeight * ((midpoint_error * midpoint_error + charbonnier_epsilon * charbonnier_epsilon).sqrt() - charbonnier_epsilon).mean()
 			loss.backward()
 			optimizer.step()
 			for offsets, weights in layer_params:
-				offsets.data.clamp_(min=-member_support_extent, max=member_support_extent)
-			if step % 250 == 249 or step + 1 == arguments.steps:
+				offsets.data.clamp_(min=-normalized_support_extent, max=normalized_support_extent)
+			if step % 250 == 249:
 				print(f"  member {member_index + 1}/{len(kernels)} param {member_param:.2f} step {step + 1}/{arguments.steps} loss {loss.item():.3e}", flush=True)
 
-		#~ Dedrick: Extract trained member taps.
-		# NOTE(Dedrick): Warm start stays in parameter space. The LUT stores the
-		# gated weights.
+		#~ Dedrick: Extract member taps (Eq. 2).
 		member_taps = np.empty((arguments.layers, arguments.samples, 3), dtype=np.float32)
+		raw_parameters = np.empty((arguments.layers, arguments.samples, 3), dtype=np.float32)
 		for layer_index, (offsets, weights) in enumerate(layer_params):
-			raw_offsets = offsets.detach().cpu().numpy()
-			raw_weights = weights.detach().cpu().numpy()
-			previous_parameters[layer_index, :, :2] = raw_offsets
-			previous_parameters[layer_index, :, 2] = raw_weights
+			raw_offsets = offsets.detach().cpu().numpy() / normalized_scale
 			member_taps[layer_index, :, :2] = raw_offsets
 			member_taps[layer_index, :, 2] = dk_gated_weights(weights.detach()).cpu().numpy()
+			raw_parameters[layer_index, :, :2] = raw_offsets
+			raw_parameters[layer_index, :, 2] = weights.detach().cpu().numpy()
+		previous_raw_parameters = raw_parameters
+		previous_raw_param = member_param
 		members.append((member_param, member_taps))
 		print(f"trained member {member_index + 1}/{len(kernels)} param {member_param:.4f} loss {loss.item():.3e}")
 
-	#~ Dedrick: Export LUT.
+	#~ Dedrick: Export runtime LUT (Eq. 9).
 	header_format = "<ffIIII"
 	entry_format = "<fII"
 	tap_format = "<fff"
-	header_size = struct.calcsize(header_format)
 	entry_size = struct.calcsize(entry_format)
 	tap_count = arguments.layers * arguments.samples
-	lut_bytes = bytearray(header_size)
+	lut_bytes = bytearray(struct.calcsize(header_format))
 	directory_offset = len(lut_bytes)
 	lut_bytes += bytearray(len(members) * entry_size)
-	header_param_min, header_param_max = float(members[0][0]), float(members[-1][0])
-	struct.pack_into(header_format, lut_bytes, 0, header_param_min, header_param_max, arguments.layers, arguments.samples, directory_offset, len(members))
+	struct.pack_into(header_format, lut_bytes, 0, float(members[0][0]), float(members[-1][0]), arguments.layers, arguments.samples, directory_offset, len(members))
 	for member_index, (member_param, member_taps) in enumerate(members):
 		tap_offset = len(lut_bytes)
 		for layer_index in range(arguments.layers):
@@ -278,7 +322,7 @@ def main():
 		os.makedirs(out_directory, exist_ok=True)
 	with open(arguments.out, "wb") as lut_file:
 		lut_file.write(lut_bytes)
-	print(f"Exported runtime LUT to '{arguments.out}' ({len(members)} members, {os.path.getsize(arguments.out)} bytes)")
+	print(f"Exported runtime LUT to '{arguments.out}' ({len(members)} members, {len(lut_bytes)} bytes)")
 
 
 if __name__ == "__main__":
