@@ -31,6 +31,36 @@ the later layers from washing out the first-layer shape. Such code may appear on
 development branches. All code on the main branch, except third-party code, is
 written by me from scratch.
 
+## Benchmark
+
+![Benchmark](images/benchmark_4096x2048.png)
+
+Measured on an RTX 5070 at 4096x2048 with the ampersand aperture. DSKC stays near
+3.6 ms from 5 to 250 px. The direct mask convolution rises from 58 to 69 ms as
+the aperture grows. The x axis uses a log scale. The raw values come from the
+playground benchmark export.
+
+## Results
+
+| Radius | DSKC | Direct mask |
+| --- | --- | --- |
+| 8 px | ![DSKC at 8 px](images/shanghai_dskc_008px.png) | ![Direct mask at 8 px](images/shanghai_direct_008px.png) |
+| 16 px | ![DSKC at 16 px](images/shanghai_dskc_016px.png) | ![Direct mask at 16 px](images/shanghai_direct_016px.png) |
+| 32 px | ![DSKC at 32 px](images/shanghai_dskc_032px.png) | ![Direct mask at 32 px](images/shanghai_direct_032px.png) |
+| 64 px | ![DSKC at 64 px](images/shanghai_dskc_064px.png) | ![Direct mask at 64 px](images/shanghai_direct_064px.png) |
+| 128 px | ![DSKC at 128 px](images/shanghai_dskc_128px.png) | ![Direct mask at 128 px](images/shanghai_direct_128px.png) |
+
+A crop of `shanghai_bund_4k.hdr` with the same ampersand aperture. DSKC is the
+second column and the direct mask convolution is the third. The direct path is
+the naive dense convolution that the sparse method replaces.
+
+## Files of Interest
+
+- `src/playground/playground.cpp` has the runtime. Grep for `@blur_impl`.
+- `tools/dskc.py` trains the sparse basis LUT.
+- `tools/bokeh.py` builds the direct mask LUT.
+- `res/` holds the embedded LUTs and the stamp.
+
 ## Build
 
 Install the Visual Studio 2022 Build Tools and the Windows SDK. Open an x64
@@ -68,33 +98,3 @@ python tools/bokeh.py res/bokeh_ampersand.png --out res/bokeh_lut.bin
 
 The build embeds every file listed in `src/playground/playground.embed`. Write
 the outputs to `res/dskc_lut.bin` and `res/bokeh_lut.bin`, then rerun the build.
-
-## Benchmark
-
-![Benchmark](images/benchmark_4096x2048.png)
-
-Measured on an RTX 5070 at 4096x2048 with the ampersand aperture. DSKC stays near
-3.6 ms from 5 to 250 px. The direct mask convolution rises from 58 to 69 ms as
-the aperture grows. The x axis uses a log scale. The raw values come from the
-playground benchmark export.
-
-## Results
-
-| Radius | DSKC | Direct mask |
-| --- | --- | --- |
-| 8 px | ![DSKC at 8 px](images/shanghai_dskc_008px.png) | ![Direct mask at 8 px](images/shanghai_direct_008px.png) |
-| 16 px | ![DSKC at 16 px](images/shanghai_dskc_016px.png) | ![Direct mask at 16 px](images/shanghai_direct_016px.png) |
-| 32 px | ![DSKC at 32 px](images/shanghai_dskc_032px.png) | ![Direct mask at 32 px](images/shanghai_direct_032px.png) |
-| 64 px | ![DSKC at 64 px](images/shanghai_dskc_064px.png) | ![Direct mask at 64 px](images/shanghai_direct_064px.png) |
-| 128 px | ![DSKC at 128 px](images/shanghai_dskc_128px.png) | ![Direct mask at 128 px](images/shanghai_direct_128px.png) |
-
-A crop of `shanghai_bund_4k.hdr` with the same ampersand aperture. DSKC is the
-second column and the direct mask convolution is the third. The direct path is
-the naive dense convolution that the sparse method replaces.
-
-## Files of Interest
-
-- `src/playground/playground.cpp` has the runtime. Grep for `@blur_impl`.
-- `tools/dskc.py` trains the sparse basis LUT.
-- `tools/bokeh.py` builds the direct mask LUT.
-- `res/` holds the embedded LUTs and the stamp.
