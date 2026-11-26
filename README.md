@@ -1,4 +1,4 @@
-# Differentiable Sparse Kernel Complex
+# DISK: Differentiable Sparse Kernel Complex
 
 Dense convolution with large, arbitrary kernels is really expensive, which makes
 it a poor fit for real-time applications like games, mobile UI, etc.
