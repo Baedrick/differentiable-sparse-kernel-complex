@@ -1,16 +1,18 @@
-# Linear Dual Kawase Blur
+# Differentiable Sparse Kernel Complex
 
-Dual Kawase (or Dual Filtering) Blur (Marius Bjørge, 2015) is really simple to
-implement, runs really fast, is memory bandwidth friendly, and looks really good.
-It fails for gradually blurring, which is a common usecase for any real-time
-applications like games, mobile UI, etc. makes separable gaussian or box blur
-the preferred technique.
+Dense convolution with large, arbitrary kernels is really expensive, which makes
+it a poor fit for real-time applications like games, mobile UI, etc.
+Differentiable Sparse Kernel Complex (Wu et al., 2026) replaces the dense kernel
+with a cascade of sparse kernels. The offsets and weights are learned end-to-end
+from the kernel's impulse response, and an ordered basis of filters is
+interpolated at runtime, so the cost depends on the number of sparse taps instead
+of the dense kernel size.
 
-My contribution is a set of closed-form equations that map a linear value to the
-inputs of Dual Kawase Blur to achieve a gradual blur. I derived them using a
-PyTorch curve-fitting pipeline that maximizes SSIM against a 3σ Gaussian
-reference (99.7% of the Gaussian shape) on synthetic images across various blur
-radii, then fit the final curves via regression.
+My contribution is a complete implementation of the method. The PyTorch trainer
+fits the sparse basis to Gaussian or custom stamp targets, and the D3D11 runtime
+applies the learned LUT with filter-space interpolation. I also added a direct
+bokeh mask path so the sparse result can be compared against a straightforward
+aperture convolution.
 
 # AI Usage Declaration
 
