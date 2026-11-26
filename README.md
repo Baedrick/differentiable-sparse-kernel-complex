@@ -50,9 +50,8 @@ playground benchmark export.
 | 64 px | ![DSKC at 64 px](images/shanghai_dskc_064px.png) | ![Direct mask at 64 px](images/shanghai_direct_064px.png) |
 | 128 px | ![DSKC at 128 px](images/shanghai_dskc_128px.png) | ![Direct mask at 128 px](images/shanghai_direct_128px.png) |
 
-A crop of `shanghai_bund_4k.hdr` with the same ampersand aperture. DSKC is the
-second column and the direct mask convolution is the third. The direct path is
-the naive dense convolution that the sparse method replaces.
+A crop of `shanghai_bund_4k.hdr` with the same ampersand aperture. Obtained from
+Poly Haven.
 
 ## Files of Interest
 
