@@ -14,9 +14,9 @@ playground applies the learned LUT with filter-space interpolation. A direct
 bokeh mask path is included so the result can be compared against a
 straightforward aperture convolution.
 
-The paper targets SDR. For HDR the playground filters in linear space, stores
-intermediates as `R16G16B16A16_FLOAT`, and tonemaps after the blur. The sparse
-weights are normalized, so the LUT itself does not depend on the input range.
+The paper targets SDR. For HDR the playground filters in linear space and
+tonemaps after the blur. The sparse weights are normalized, so the LUT itself
+does not depend on the input range.
 
 # AI Usage Declaration
 
