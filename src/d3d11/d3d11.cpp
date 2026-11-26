@@ -98,26 +98,16 @@ auto dk::d3d11_init(CmdLine *cmd_line) noexcept -> void {
 	//~ Dedrick: Create default blend state.
 	{
 		ZoneScopedN("create default blend state");
-		D3D11_RENDER_TARGET_BLEND_DESC blend_desc = {};
-		blend_desc.BlendEnable            = 1;
-		blend_desc.SrcBlend               = D3D11_BLEND_SRC_ALPHA;
-		blend_desc.DestBlend              = D3D11_BLEND_INV_SRC_ALPHA;
-		blend_desc.BlendOp                = D3D11_BLEND_OP_ADD;
-		blend_desc.SrcBlendAlpha          = D3D11_BLEND_ONE;
-		blend_desc.DestBlendAlpha         = D3D11_BLEND_ZERO;
-		blend_desc.BlendOpAlpha           = D3D11_BLEND_OP_ADD;
-		blend_desc.RenderTargetWriteMask  = D3D11_COLOR_WRITE_ENABLE_ALL;
 		D3D11_BLEND_DESC desc = {};
-		desc.RenderTarget[0] = blend_desc;
+		desc.RenderTarget[0].BlendEnable            = 1;
+		desc.RenderTarget[0].SrcBlend               = D3D11_BLEND_SRC_ALPHA;
+		desc.RenderTarget[0].DestBlend              = D3D11_BLEND_INV_SRC_ALPHA;
+		desc.RenderTarget[0].BlendOp                = D3D11_BLEND_OP_ADD;
+		desc.RenderTarget[0].SrcBlendAlpha          = D3D11_BLEND_ONE;
+		desc.RenderTarget[0].DestBlendAlpha         = D3D11_BLEND_ZERO;
+		desc.RenderTarget[0].BlendOpAlpha           = D3D11_BLEND_OP_ADD;
+		desc.RenderTarget[0].RenderTargetWriteMask  = D3D11_COLOR_WRITE_ENABLE_ALL;
 		error = d3d11_context->device->CreateBlendState(&desc, &d3d11_context->default_blend_state);
-	}
-
-	//~ Dedrick: Create opaque blend state.
-	{
-		ZoneScopedN("create opaque blend state");
-		D3D11_BLEND_DESC desc = {};
-		desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-		error = d3d11_context->device->CreateBlendState(&desc, &d3d11_context->opaque_blend_state);
 	}
 
 	//~ Dedrick: Create nearest clamp sampler.

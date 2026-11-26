@@ -47,7 +47,6 @@ namespace dk {
 		IDXGIFactory2 *dxgi_factory;
 		ID3D11RasterizerState *default_rasterizer;
 		ID3D11BlendState *default_blend_state;
-		ID3D11BlendState *opaque_blend_state;
 		ID3D11SamplerState *samplers[D3D11_SampleKind_COUNT];
 	};
 

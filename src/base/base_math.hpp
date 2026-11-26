@@ -72,6 +72,7 @@ namespace dk {
 	inline auto sqrt(f32 v) noexcept -> f32 { return std::sqrtf(v); }
 	inline auto exp(f32 v) noexcept -> f32 { return std::expf(v); }
 	inline auto log_e(f32 v) noexcept -> f32 { return std::logf(v); }
+	inline auto log2(f32 v) noexcept -> f32 { return std::log2f(v); }
 	inline auto log10(f32 v) noexcept -> f32 { return std::log10f(v); }
 	inline auto pow(f32 b, f32 e) noexcept -> f32 { return std::powf(b, e); }
 	inline auto floor(f32 v) noexcept -> f32 { return std::floorf(v); }
