@@ -36,26 +36,26 @@ namespace dk {
 
 	enum PG_VShaderKind {
 		PG_VShaderKind_DSKC,
-		PG_VShaderKind_SeparableGaussian,
+		PG_VShaderKind_Bokeh,
 		PG_VShaderKind_Finalize,
 		PG_VShaderKind_COUNT
 	};
 	inline String8 const pg_v_shader_kind_src_table[] = {
 		pg_dskc_vs_bytes,
-		pg_separable_gaussian_vs_bytes,
+		pg_bokeh_vs_bytes,
 		pg_finalize_vs_bytes,
 	};
 	static_assert(array_count(pg_v_shader_kind_src_table) == PG_VShaderKind_COUNT);
 
 	enum PG_PShaderKind {
 		PG_PShaderKind_DSKC,
-		PG_PShaderKind_SeparableGaussian,
+		PG_PShaderKind_Bokeh,
 		PG_PShaderKind_Finalize,
 		PG_PShaderKind_COUNT
 	};
 	inline String8 const pg_p_shader_kind_src_table[] = {
 		pg_dskc_ps_bytes,
-		pg_separable_gaussian_ps_bytes,
+		pg_bokeh_ps_bytes,
 		pg_finalize_ps_bytes,
 	};
 	static_assert(array_count(pg_p_shader_kind_src_table) == PG_PShaderKind_COUNT);
@@ -70,21 +70,22 @@ namespace dk {
 		u32 directory_offset;
 		u32 directory_count;
 	};
-	static_assert(sizeof(PG_DSKCLutHeader) == 24);
 
 	struct PG_DSKCLutEntry {
 		f32 param;
 		u32 tap_offset;
 		u32 tap_count;
 	};
-	static_assert(sizeof(PG_DSKCLutEntry) == 12);
 
 	struct PG_DSKCLutTap {
 		f32 offset_x;
 		f32 offset_y;
 		f32 weight;
 	};
-	static_assert(sizeof(PG_DSKCLutTap) == 12);
+
+	struct PG_BokehLutHeader {
+		u32 mask_dim;
+	};
 
 	struct PG_Uniform_DSKCPass {
 		vec2 uv_step;
@@ -98,45 +99,36 @@ namespace dk {
 		PG_Uniform_DSKCPass passes[PG_DSKCLutMaxLayers];
 	};
 
-	struct PG_Uniform_GaussianPass {
+	struct PG_Uniform_Bokeh {
 		vec2 uv_step;
-		s32 kernel_size;
-		u8 _pad0[244];
-	};
-	static_assert(sizeof(PG_Uniform_GaussianPass) % 256 == 0);
-
-	struct PG_Uniform_Gaussian {
-		PG_Uniform_GaussianPass passes[Axis2_COUNT];
+		s32 mask_dim;
 	};
 
 	enum PG_UniformKind {
 		PG_UniformKind_DSKC,
-		PG_UniformKind_SeparableGaussian,
+		PG_UniformKind_Bokeh,
 		PG_UniformKind_COUNT
 	};
 	inline u64 const pg_uniform_type_kind_size_table[] = {
 		sizeof(PG_Uniform_DSKC),
-		sizeof(PG_Uniform_Gaussian),
+		sizeof(PG_Uniform_Bokeh),
 	};
 	static_assert(array_count(pg_uniform_type_kind_size_table) == PG_UniformKind_COUNT);
 
 	enum PG_BlurKind {
 		PG_BlurKind_DSKC,
-		PG_BlurKind_SeparableGaussian,
+		PG_BlurKind_Bokeh,
 		PG_BlurKind_COUNT
 	};
 	inline String8 const pg_blur_kind_name_table[] = {
-		"Differentiable Sparse Kernel Complex"_str8,
-		"Separable Gaussian"_str8,
+		"DSKC"_str8,
+		"Bokeh"_str8,
 	};
 	static_assert(array_count(pg_blur_kind_name_table) == PG_BlurKind_COUNT);
 
-	// https://lospec.com/palette-list/island-joy-16
 	constexpr u32 pg_blur_kind_color_table[] = {
 		0xFF6424C9,
 		0xFFC1AD11,
-		0xFF61B35B,
-		0xFF684DCB,
 	};
 	static_assert(array_count(pg_blur_kind_color_table) >= PG_BlurKind_COUNT);
 
@@ -266,15 +258,14 @@ namespace dk {
 		PG_BlurKind blur_kind;
 		s32 blur_radius;
 
-		//~ Dedrick: Gaussian state.
-		ID3D11Buffer *gaussian_kernel_buffer;
-		ID3D11ShaderResourceView *gaussian_kernel_buffer_srv;
-		s32 gaussian_kernel_radius;
-
 		//~ Dedrick: DSKC state.
 		ID3D11Buffer *dskc_lut_buffer;
 		ID3D11ShaderResourceView *dskc_lut_buffer_srv;
 		s32 dskc_lut_blur_radius;
+
+		//~ Dedrick: Bokeh state.
+		ID3D11Buffer *bokeh_mask_buffer;
+		ID3D11ShaderResourceView *bokeh_mask_srv;
 
 		//~ Dedrick: Benchmark options.
 		u32 benchmark_blur_kind_flags;

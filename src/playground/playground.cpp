@@ -428,88 +428,25 @@ auto dk::pg_blur(Arena *arena, PG_BlurParams const *params) noexcept -> PG_Displ
 				}
 				break;
 			}
-			case PG_BlurKind_SeparableGaussian: {
-				ID3D11VertexShader *v_shader = pg_context->v_shaders[PG_VShaderKind_SeparableGaussian];
-				ID3D11PixelShader *p_shader = pg_context->p_shaders[PG_PShaderKind_SeparableGaussian];
-				ID3D11Buffer *uniform_buffer = pg_context->uniform_buffers[PG_UniformKind_SeparableGaussian];
+			case PG_BlurKind_Bokeh: {
+				ID3D11VertexShader *v_shader = pg_context->v_shaders[PG_VShaderKind_Bokeh];
+				ID3D11PixelShader *p_shader = pg_context->p_shaders[PG_PShaderKind_Bokeh];
+				ID3D11Buffer *uniform_buffer = pg_context->uniform_buffers[PG_UniformKind_Bokeh];
 				uvec2 const src_dim = params->src_dim;
 
-				//~ Dedrick: Blur radius changed -> calculate new kernel.
-				s32 const kernel_size = params->blur_radius + 1;
-				if (pg_context->gaussian_kernel_radius != params->blur_radius) {
-					pg_context->gaussian_kernel_radius = params->blur_radius;
-
-					// NOTE(Dedrick): Derivation of kernel constants.
-					//
-					//   Standard Gaussian: G(x) = (1 / sqrt(2 * PI * sigma^2)) * exp(-x^2 / (2 * sigma^2))
-					//
-					// The effective blur radius R of a Gaussian is 3 sigma (6 sigma for diameter):
-					//
-					//   R = 3 * sigma -> sigma = R / 3
-					//
-					// Substituting sigma into the exponent:
-					//
-					//   -x^2 / (2 * (R / 3)^2) = -9 * x^2 / (2 * R^2) = -4.5 * (x / R)^2
-					//
-					// For discrete taps x = i in [0, R]:
-					//   weight[i] proportional to exp(-4.5 * (i / R)^2)
-					// The leading factor (1 / sqrt(2 * PI * sigma^2)) is constant across all taps and cancels
-					// out completely during discrete normalization (sum(weights) = 1.0). exp(0) == 1.0.
-					f32 *const kernel = arena_push_array<f32>(scratch.arena, kernel_size);
-					f32 const radius = static_cast<f32>(params->blur_radius);
-					f32 const inv_radius = 1.0f / radius;
-					f32 const factor = -4.5f * inv_radius * inv_radius;
-
-					//~ Dedrick: Fill kernel.
-					kernel[0] = 1.0f;
-					f32 sum = 1.0f;
-					for (s32 i = 1; i < kernel_size; ++i) {
-						f32 const fi = static_cast<f32>(i);
-						f32 const w = exp(factor * (fi * fi));
-						kernel[i] = w;
-						sum += w * 2.0f;
-					}
-
-					//~ Dedrick: Normalize to get energy == 1.0.
-					f32 const inv_sum = 1.0f / sum;
-					for (s32 i = 0; i < kernel_size; ++i) {
-						kernel[i] *= inv_sum;
-					}
-
-					D3D11_MAPPED_SUBRESOURCE mapped = {};
-					d_ctx->Map(pg_context->gaussian_kernel_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-					memory_copy(mapped.pData, kernel, kernel_size * sizeof(f32));
-					d_ctx->Unmap(pg_context->gaussian_kernel_buffer, 0);
-				}
+				//~ Dedrick: Parse bokeh lut.
+				u8 const *lut_base = pg_bokeh_lut_file_bytes.data;
+				PG_BokehLutHeader const *lut_hdr = reinterpret_cast<PG_BokehLutHeader const *>(lut_base);
 
 				//~ Dedrick: Set up uniforms.
-				{
-					PG_Uniform_Gaussian uniforms = {};
-					f32 const inv_w = 1.0f / static_cast<f32>(src_dim.x);
-					f32 const inv_h = 1.0f / static_cast<f32>(src_dim.y);
-
-					//~ Dedrick: Horizontal pass uniforms.
-					uniforms.passes[Axis2_X].uv_step     = { inv_w, 0.0f };
-					uniforms.passes[Axis2_X].kernel_size = kernel_size;
-
-					//~ Dedrick: Vertical pass uniforms.
-					uniforms.passes[Axis2_Y].uv_step     = { 0.0f, inv_h };
-					uniforms.passes[Axis2_Y].kernel_size = kernel_size;
-
-					D3D11_MAPPED_SUBRESOURCE mapped_cbuffer = {};
-					d_ctx->Map(uniform_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_cbuffer);
-					memory_copy_struct(mapped_cbuffer.pData, &uniforms);
-					d_ctx->Unmap(uniform_buffer, 0);
-				}
-
-				u32 const uniform_offsets[Axis2_COUNT] = {
-					0 * sizeof(PG_Uniform_GaussianPass) / 16,
-					1 * sizeof(PG_Uniform_GaussianPass) / 16,
-				};
-				u32 const uniform_counts[Axis2_COUNT] = {
-					sizeof(PG_Uniform_GaussianPass) / 16,
-					sizeof(PG_Uniform_GaussianPass) / 16,
-				};
+				PG_Uniform_Bokeh uniforms = {};
+				f32 const param = static_cast<f32>(params->blur_radius);
+				uniforms.uv_step = { param / static_cast<f32>(src_dim.x), param / static_cast<f32>(src_dim.y) };
+				uniforms.mask_dim = static_cast<s32>(lut_hdr->mask_dim);
+				D3D11_MAPPED_SUBRESOURCE mapped_cbuffer = {};
+				d_ctx->Map(uniform_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_cbuffer);
+				memory_copy_struct(mapped_cbuffer.pData, &uniforms);
+				d_ctx->Unmap(uniform_buffer, 0);
 
 				//~ Dedrick: Set rasterizer.
 				D3D11_VIEWPORT const viewport = { 0.0f, 0.0f, static_cast<f32>(src_dim.x), static_cast<f32>(src_dim.y), 0.0f, 1.0f };
@@ -522,28 +459,19 @@ auto dk::pg_blur(Arena *arena, PG_BlurParams const *params) noexcept -> PG_Displ
 				//~ Dedrick: Set shaders.
 				d_ctx->VSSetShader(v_shader, nullptr, 0);
 				d_ctx->PSSetShader(p_shader, nullptr, 0);
-				d_ctx->PSSetShaderResources(1, 1, &pg_context->gaussian_kernel_buffer_srv);
+				d_ctx->PSSetShaderResources(1, 1, &pg_context->bokeh_mask_srv);
 
 				// NOTE(Dedrick): For unbinding rtv.
 				ID3D11RenderTargetView *rtv = nullptr;
 
-				//~ Dedrick: Horizontal pass.
-				PG_BlurTexture *const blur_h = pg_blur_texture_cache_get_or_create(src_dim, DXGI_FORMAT_R11G11B10_FLOAT);
-				d_ctx->OMSetRenderTargets(1, &blur_h->rtv, nullptr);
-				d_ctx->PSSetConstantBuffers1(0, 1, &uniform_buffer, &uniform_offsets[Axis2_X], &uniform_counts[Axis2_X]);
+				//~ Dedrick: Bokeh pass.
+				PG_BlurTexture *const blur_texture = pg_blur_texture_cache_get_or_create(src_dim, DXGI_FORMAT_R16G16B16A16_FLOAT);
+				d_ctx->OMSetRenderTargets(1, &blur_texture->rtv, nullptr);
+				d_ctx->PSSetConstantBuffers(0, 1, &uniform_buffer);
 				d_ctx->PSSetShaderResources(0, 1, &params->src_srv);
 				d_ctx->Draw(3, 0);
 				d_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-				pg_display_entry_list_push(arena, &display_entries, "Horizontal"_str8, blur_h->dim, blur_h->srv);
-
-				//~ Dedrick: Vertical pass.
-				PG_BlurTexture *const blur_v = pg_blur_texture_cache_get_or_create(src_dim, DXGI_FORMAT_R11G11B10_FLOAT);
-				d_ctx->OMSetRenderTargets(1, &blur_v->rtv, nullptr);
-				d_ctx->PSSetConstantBuffers1(0, 1, &uniform_buffer, &uniform_offsets[Axis2_Y], &uniform_counts[Axis2_Y]);
-				d_ctx->PSSetShaderResources(0, 1, &blur_h->srv);
-				d_ctx->Draw(3, 0);
-				d_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-				pg_display_entry_list_push(arena, &display_entries, "Vertical"_str8, blur_v->dim, blur_v->srv);
+				pg_display_entry_list_push(arena, &display_entries, "Bokeh"_str8, blur_texture->dim, blur_texture->srv);
 				break;
 			}
 		}
@@ -645,24 +573,28 @@ auto dk::pg_init(CmdLine *cmd_line) noexcept -> void {
 		d3d11_device_context()->PSSetSamplers(0, static_cast<UINT>(array_count(samplers)), samplers);
 	}
 
-	//~ Dedrick: Set up gaussian state.
+	//~ Dedrick: Set up bokeh state.
 	{
+		u8 const *base = pg_bokeh_lut_file_bytes.data;
+		PG_BokehLutHeader const *header = reinterpret_cast<PG_BokehLutHeader const *>(base);
+		u32 const mask_float_count = header->mask_dim * header->mask_dim;
 		D3D11_BUFFER_DESC desc = {};
 		{
-			desc.ByteWidth = static_cast<UINT>((PG_BlurRadiusMax + 1) * sizeof(f32));
-			desc.Usage = D3D11_USAGE_DYNAMIC;
+			desc.ByteWidth = static_cast<UINT>(mask_float_count * sizeof(f32));
+			desc.Usage = D3D11_USAGE_IMMUTABLE;
 			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 		}
+		D3D11_SUBRESOURCE_DATA initial_data = {};
+		initial_data.pSysMem = base + sizeof(PG_BokehLutHeader);
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 		{
 			srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
 			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
 			srv_desc.Buffer.FirstElement = 0;
-			srv_desc.Buffer.NumElements = PG_BlurRadiusMax + 1;
+			srv_desc.Buffer.NumElements = mask_float_count;
 		}
-		d3d11_device()->CreateBuffer(&desc, nullptr, &pg_context->gaussian_kernel_buffer);
-		d3d11_device()->CreateShaderResourceView(pg_context->gaussian_kernel_buffer, &srv_desc, &pg_context->gaussian_kernel_buffer_srv);
+		d3d11_device()->CreateBuffer(&desc, &initial_data, &pg_context->bokeh_mask_buffer);
+		d3d11_device()->CreateShaderResourceView(pg_context->bokeh_mask_buffer, &srv_desc, &pg_context->bokeh_mask_srv);
 	}
 
 	//~ Dedrick: Set up DSKC state.
@@ -1676,6 +1608,9 @@ auto dk::pg_frame() noexcept -> b8 {
 					}
 				}
 				benchmark->kind_count = kind_idx;
+				for (u64 idx = 0; idx < benchmark->kind_count; ++idx) {
+					benchmark->batch_iteration_ms[benchmark->kind_order[idx]] = 30.0f;
+				}
 
 				//~ Dedrick: Fill geometric radius to profiling points.
 				pg_benchmark_fill_radii(pg_context->benchmark_arena, benchmark, PG_BlurRadiusMax);
